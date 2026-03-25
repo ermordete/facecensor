@@ -1,19 +1,23 @@
 #!/usr/bin/python3
 """
-ui.py - Hauptfenster und GUI
+ui.py – Hauptfenster und GUI
 ==============================
-Änderungen v2:
-- Alle Emojis aus Button-Beschriftungen und Labels entfernt
-- Farben korrigiert: alle Control-Buttons/Panels in Chalk Beige (#E1DACA)
-- Entfernte Effekte (Gaussian/Strong Blur) aus UI entfernt
-- Performance: Detection nur alle N Frames (DETECT_EVERY_N_FRAMES)
-- Performance: Frame-Signal gedrosselt, kein Signal wenn kein neuer Frame
-- Performance: FastTransformation statt SmoothTransformation für Pixmap-Scaling
+Version 3 – Finale Überarbeitung:
+- Vollständig deutsche Oberfläche
+- Farben konsequent über zentrales QSS durchgesetzt
+  (Navy #1F2A36 · Beige #E1DACA · Sage #CBCCBE)
+- Schrift: Noto Sans / DejaVu Sans / Liberation Sans (sauber, modern, lesbar)
+- FPS: gleitender Durchschnitt über 30 Frames im ProcessingThread
+- Kein Palatino / keine handschriftlichen Fonts mehr
+- Alle inline-Styles auf das zentrale GLOBAL_STYLE-QSS reduziert
+- Ästhetik: clean, minimalistisch, professionell
 """
 
 import cv2
 import numpy as np
 import os
+import time
+from collections import deque
 
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
@@ -21,7 +25,7 @@ from PyQt5.QtWidgets import (
     QSizePolicy, QButtonGroup,
 )
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
-from PyQt5.QtGui import QImage, QPixmap
+from PyQt5.QtGui import QImage, QPixmap, QFontDatabase, QFont
 
 from camera import CameraThread
 from detector import FaceDetector
@@ -29,128 +33,242 @@ from effects import EffectsProcessor, EFFECTS, EMOJIS, PRESETS, DEFAULT_EFFECT
 from recorder import Recorder
 
 
-# ─── Farb-Konstanten ─────────────────────────────────────────────────────────
-C_BG         = "#1F2A36"   # Navy Blue - Hintergrund
-C_PANEL      = "#263545"   # Panel-Hintergrund (etwas heller)
-C_BUTTON     = "#E1DACA"   # Chalk Beige - alle Control-Buttons
-C_BUTTON_HOV = "#F0EDE6"   # Heller Beige - Hover
-C_BUTTON_ACT = "#C8C4B4"   # Dunkler Beige - Pressed
-C_TEXT       = "#CBCCBE"   # Sage - Haupttext
-C_TEXT_DIM   = "#8A9099"   # Gedimmter Text
-C_ACCENT     = "#4A9EBF"   # Akzentblau (aktiver Effekt, Slider)
-C_DANGER     = "#BF4A4A"   # Rot - Stopp/Aufnahme
-C_SUCCESS    = "#4ABF7E"   # Grün - Aufnahme starten
-C_BORDER     = "#2E3F50"   # Dezente Border
+# ═══════════════════════════════════════════════════════════════════════════════
+#  FARB-KONSTANTEN  (einmalig definiert, überall referenziert)
+# ═══════════════════════════════════════════════════════════════════════════════
+C_BG         = "#1F2A36"   # Navy Blue     – App-Hintergrund
+C_PANEL      = "#263545"   # Dunkel-Panel  – Seitenleisten, Cards
+C_PANEL2     = "#2C3E50"   # Etwas heller  – Stats-Bar, Header
+C_BUTTON     = "#E1DACA"   # Chalk Beige   – alle Bedien-Buttons
+C_BUTTON_HOV = "#EDE9E0"   # Beige hell    – Hover-Zustand
+C_BUTTON_ACT = "#CAC6B6"   # Beige dunkel  – Pressed-Zustand
+C_TEXT       = "#CBCCBE"   # Sage          – Fließtext, Labels
+C_TEXT_DIM   = "#7A8490"   # Gedimmt       – Unter-Labels, Hints
+C_TEXT_DARK  = "#1F2A36"   # Navy          – Text auf Beige-Buttons
+C_ACCENT     = "#4A9EBF"   # Blau          – aktiver Effekt, Slider
+C_DANGER     = "#BF4A4A"   # Rot           – Aufnahme stoppen
+C_SUCCESS    = "#4A9E72"   # Grün          – Aufnahme starten
+C_BORDER     = "#33495C"   # Border        – Panel-Rahmen
+C_VIDEO_BG   = "#0D1720"   # Fast-Schwarz  – Kamera-Hintergrund
 
-# ─── Performance-Einstellung ─────────────────────────────────────────────────
-# Detection nur jeden N-ten Frame ausführen.
-# Zwischen den Detection-Frames werden die letzten bekannten Bounding Boxes
-# wiederverwendet → deutlich flüssigerer Feed bei gleicher Erkennungsqualität.
-# Wert 3 = Detection ~10x/Sek bei 30 FPS. Wert 2 für schnellere Reaktion.
-DETECT_EVERY_N_FRAMES = 3
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SCHRIFTART  – robuste Linux-Fallback-Kette, kein Palatino
+# ═══════════════════════════════════════════════════════════════════════════════
+FONT_STACK = '"Noto Sans", "DejaVu Sans", "Liberation Sans", "Ubuntu", Arial, sans-serif'
 
-# ─── Stylesheet ──────────────────────────────────────────────────────────────
-# Alle Control-Elemente in Chalk Beige, Hintergrund Navy Blue, Text Sage.
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PERFORMANCE
+# ═══════════════════════════════════════════════════════════════════════════════
+DETECT_EVERY_N_FRAMES = 3   # Detection nur jeden 3. Frame → flüssigerer Feed
+FPS_WINDOW = 30             # Gleitender FPS-Durchschnitt über N Frames
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ZENTRALES STYLESHEET  (QSS)
+#  Alle Farben, Fonts und Abstände sind hier definiert.
+#  Einzelne Widgets überschreiben NUR was wirklich abweicht.
+# ═══════════════════════════════════════════════════════════════════════════════
 GLOBAL_STYLE = f"""
+
+/* ── Basis ── */
 QMainWindow, QWidget {{
     background-color: {C_BG};
     color: {C_TEXT};
-    font-family: "Palatino Linotype", "Palatino", "Book Antiqua", Georgia, serif;
+    font-family: {FONT_STACK};
     font-size: 13px;
 }}
 
-/* Standard-Button: Chalk Beige */
+/* ── Alle Buttons: Chalk Beige Hintergrund, Sage Text ── */
 QPushButton {{
     background-color: {C_BUTTON};
-    color: #1F2A36;
+    color: {C_TEXT_DARK};
     border: none;
-    border-radius: 10px;
+    border-radius: 8px;
     padding: 9px 14px;
-    font-weight: 600;
-    font-family: "Palatino Linotype", "Palatino", "Book Antiqua", Georgia, serif;
+    font-family: {FONT_STACK};
     font-size: 12px;
+    font-weight: 500;
     text-align: left;
+    outline: none;
 }}
-QPushButton:hover  {{ background-color: {C_BUTTON_HOV}; }}
-QPushButton:pressed {{ background-color: {C_BUTTON_ACT}; padding-top: 10px; padding-bottom: 8px; }}
-QPushButton:disabled {{ background-color: #3A4858; color: {C_TEXT_DIM}; }}
+QPushButton:hover {{
+    background-color: {C_BUTTON_HOV};
+}}
+QPushButton:pressed {{
+    background-color: {C_BUTTON_ACT};
+}}
+QPushButton:disabled {{
+    background-color: {C_PANEL};
+    color: {C_TEXT_DIM};
+}}
 
-/* Labels */
-QLabel {{ color: {C_TEXT}; background: transparent; }}
+/* ── Aktiver Effekt-Button ── */
+QPushButton[active="true"] {{
+    background-color: {C_ACCENT};
+    color: #FFFFFF;
+    font-weight: 600;
+}}
 
-/* Slider */
+/* ── Aufnahme-Button (Rot) ── */
+QPushButton[danger="true"] {{
+    background-color: {C_DANGER};
+    color: #FFFFFF;
+    font-weight: 600;
+}}
+QPushButton[danger="true"]:hover {{
+    background-color: #CC5555;
+}}
+
+/* ── Start-Button (Grün) ── */
+QPushButton[success="true"] {{
+    background-color: {C_SUCCESS};
+    color: #FFFFFF;
+    font-weight: 600;
+}}
+QPushButton[success="true"]:hover {{
+    background-color: #5AAD80;
+}}
+
+/* ── Erkennung aktiv ── */
+QPushButton[detection="active"] {{
+    background-color: {C_ACCENT};
+    color: #FFFFFF;
+    font-weight: 600;
+}}
+QPushButton[detection="inactive"] {{
+    background-color: {C_BUTTON};
+    color: {C_TEXT_DARK};
+}}
+
+/* ── Labels ── */
+QLabel {{
+    background: transparent;
+    color: {C_TEXT};
+    font-family: {FONT_STACK};
+}}
+
+/* ── Abschnitts-Überschriften ── */
+QLabel[role="section"] {{
+    color: {C_TEXT_DIM};
+    font-size: 10px;
+    letter-spacing: 1.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+}}
+
+/* ── Stat-Wert (groß) ── */
+QLabel[role="stat-value"] {{
+    color: #FFFFFF;
+    font-size: 20px;
+    font-weight: 700;
+    font-family: {FONT_STACK};
+}}
+
+/* ── Stat-Label (klein, gedimmt) ── */
+QLabel[role="stat-label"] {{
+    color: {C_TEXT_DIM};
+    font-size: 10px;
+    letter-spacing: 1px;
+}}
+
+/* ── Panel / Card ── */
+QFrame[role="panel"] {{
+    background-color: {C_PANEL};
+    border-radius: 10px;
+    border: 1px solid {C_BORDER};
+}}
+
+/* ── Slider ── */
 QSlider::groove:horizontal {{
-    height: 4px; background: {C_BORDER}; border-radius: 2px;
+    height: 3px;
+    background: {C_BORDER};
+    border-radius: 2px;
+    margin: 0px;
 }}
 QSlider::handle:horizontal {{
-    background: {C_BUTTON}; border: none;
-    width: 14px; height: 14px; margin: -5px 0; border-radius: 7px;
+    background: {C_BUTTON};
+    width: 14px;
+    height: 14px;
+    margin: -6px 0;
+    border-radius: 7px;
+    border: none;
 }}
-QSlider::sub-page:horizontal {{ background: {C_ACCENT}; border-radius: 2px; }}
+QSlider::sub-page:horizontal {{
+    background: {C_ACCENT};
+    border-radius: 2px;
+}}
 
-/* Scrollbar */
-QScrollBar:vertical {{ background: {C_BG}; width: 6px; border-radius: 3px; }}
-QScrollBar::handle:vertical {{ background: {C_BORDER}; border-radius: 3px; min-height: 30px; }}
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; }}
+/* ── Scrollbar (schmal, dezent) ── */
+QScrollBar:vertical {{
+    background: transparent;
+    width: 5px;
+}}
+QScrollBar::handle:vertical {{
+    background: {C_BORDER};
+    border-radius: 2px;
+    min-height: 20px;
+}}
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical {{ height: 0; }}
+QScrollBar::add-page:vertical,
+QScrollBar::sub-page:vertical {{ background: transparent; }}
 """
 
 
-# ─── Hilfsfunktionen ─────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  HILFSFUNKTIONEN
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def make_section_label(text: str) -> QLabel:
+def section_label(text: str) -> QLabel:
+    """Abschnitts-Überschrift im gedimmten Stil."""
     lbl = QLabel(text.upper())
-    lbl.setStyleSheet(f"color: {C_TEXT_DIM}; font-size: 10px; letter-spacing: 2px; background: transparent;")
+    lbl.setProperty("role", "section")
+    # setProperty allein reicht nicht zum Neu-Rendern → explizit Style nochmal setzen
+    lbl.setStyleSheet(
+        f"color: {C_TEXT_DIM}; font-size: 10px; letter-spacing: 1.5px; "
+        f"font-weight: 600; font-family: {FONT_STACK}; background: transparent;"
+    )
     return lbl
 
 
-def panel_style() -> str:
-    return f"background: {C_PANEL}; border-radius: 12px; border: 1px solid {C_BORDER};"
+def set_btn_prop(btn: QPushButton, prop: str, value: str):
+    """Setzt eine Qt-Property und erzwingt Stylesheet-Neuberechnung."""
+    btn.setProperty(prop, value)
+    btn.style().unpolish(btn)
+    btn.style().polish(btn)
+    btn.update()
 
 
-def effect_btn_style(checked: bool = False) -> str:
-    """Chalk Beige Effekt-Button. Aktiv: Akzentblau."""
-    if checked:
-        return f"""
-            QPushButton {{
-                background-color: {C_ACCENT};
-                color: #FFFFFF;
-                border: none;
-                border-radius: 8px;
-                padding: 8px 12px;
-                text-align: left;
-                font-family: "Palatino Linotype", Georgia, serif;
-                font-size: 12px;
-                font-weight: 600;
-            }}
-        """
-    return f"""
-        QPushButton {{
-            background-color: {C_BUTTON};
-            color: #1F2A36;
-            border: none;
-            border-radius: 8px;
-            padding: 8px 12px;
-            text-align: left;
-            font-family: "Palatino Linotype", Georgia, serif;
-            font-size: 12px;
-            font-weight: 500;
-        }}
-        QPushButton:hover {{ background-color: {C_BUTTON_HOV}; }}
-        QPushButton:pressed {{ background-color: {C_BUTTON_ACT}; }}
-    """
+def h_divider() -> QFrame:
+    line = QFrame()
+    line.setFrameShape(QFrame.HLine)
+    line.setFixedHeight(1)
+    line.setStyleSheet(f"background: {C_BORDER}; border: none;")
+    return line
 
 
-# ─── Verarbeitungs-Thread ────────────────────────────────────────────────────
+def v_divider() -> QFrame:
+    line = QFrame()
+    line.setFrameShape(QFrame.VLine)
+    line.setFixedWidth(1)
+    line.setStyleSheet(f"background: {C_BORDER}; border: none;")
+    return line
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  VERARBEITUNGS-THREAD
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class ProcessingThread(QThread):
     """
-    Thread für Frame-Verarbeitung (Detection + Effekte).
+    Verarbeitung (Detection + Effekte) im eigenen Thread.
 
-    Performance-Optimierungen v2:
-    A) Detection nur alle DETECT_EVERY_N_FRAMES Frames → entlastet CPU/GPU
-    B) Letzte bekannte Faces werden zwischen Detection-Frames wiederverwendet
-    C) Kein Signal wenn kein neuer Frame von der Kamera → verhindert leere Updates
+    FPS-Berechnung:
+    - Gleitender Durchschnitt über FPS_WINDOW Frames
+    - Misst tatsächliche Verarbeitungsrate (nicht Kamera-Rohrate)
+    - Stabile Anzeige ohne Sprünge
     """
+    # frame, Gesichtsanzahl, FPS (geglättet)
     frame_ready = pyqtSignal(np.ndarray, int, float)
 
     def __init__(
@@ -161,34 +279,31 @@ class ProcessingThread(QThread):
         recorder: Recorder,
     ):
         super().__init__()
-        self.camera = camera
+        self.camera   = camera
         self.detector = detector
-        self.effects = effects
+        self.effects  = effects
         self.recorder = recorder
-        self._running = True
+
+        self._running           = True
         self._detection_enabled = True
-        self._frame_counter = 0
-        # Letzte bekannte Gesichter für Frame-Interpolation
-        self._last_faces = []
+        self._frame_counter     = 0
+        self._last_faces        = []
+
+        # Gleitender FPS-Puffer: speichert Zeitstempel der letzten N Frames
+        self._ts_buffer: deque = deque(maxlen=FPS_WINDOW)
 
     def run(self):
-        import time
         while self._running:
             frame = self.camera.get_frame()
-
-            # Kein neuer Frame → kurz warten, kein Signal senden
             if frame is None:
                 time.sleep(0.005)
                 continue
 
+            # ── Gesichtserkennung (gedrosselt) ──
             if self._detection_enabled:
                 self._frame_counter += 1
-
-                # PERF: Detection nur jeden N-ten Frame
                 if self._frame_counter % DETECT_EVERY_N_FRAMES == 0:
                     self._last_faces = self.detector.detect(frame)
-
-                # Zwischen Detection-Frames: letzte bekannte Faces verwenden
                 faces = self._last_faces
                 frame = self.effects.apply(frame, faces)
                 face_count = len(faces)
@@ -196,11 +311,20 @@ class ProcessingThread(QThread):
                 face_count = 0
                 self._last_faces = []
 
+            # ── Aufnahme ──
             if self.recorder.is_recording:
                 self.recorder.write_frame(frame)
 
-            fps = self.camera.get_fps()
-            self.frame_ready.emit(frame, face_count, fps)
+            # ── FPS: gleitender Durchschnitt ──
+            now = time.monotonic()
+            self._ts_buffer.append(now)
+            if len(self._ts_buffer) >= 2:
+                elapsed = self._ts_buffer[-1] - self._ts_buffer[0]
+                smooth_fps = (len(self._ts_buffer) - 1) / elapsed if elapsed > 0 else 0.0
+            else:
+                smooth_fps = 0.0
+
+            self.frame_ready.emit(frame, face_count, smooth_fps)
 
     def set_detection_enabled(self, enabled: bool):
         self._detection_enabled = enabled
@@ -212,31 +336,37 @@ class ProcessingThread(QThread):
         self.wait()
 
 
-# ─── Hauptfenster ────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  HAUPTFENSTER
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class MainWindow(QMainWindow):
     """
-    Hauptfenster von FaceCensor Pro.
-    Layout: [Effekte-Panel] | [Video-Feed] | [Presets/Aktionen-Panel]
+    FaceCensor Pro – Hauptfenster.
+    Layout: [Effekte-Panel links] | [Kamera-Feed] | [Aktions-Panel rechts]
     """
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("FaceCensor Pro  ·  Jetson Edition")
-        self.setMinimumSize(1080, 680)
-        self.resize(1200, 750)
+        self.setWindowTitle("FaceCensor Pro")
+        self.setMinimumSize(1060, 660)
+        self.resize(1180, 730)
+
+        # Zentrales Stylesheet einmalig setzen – gilt für ALLE Kind-Widgets
         self.setStyleSheet(GLOBAL_STYLE)
 
-        self.camera = CameraThread(use_csi=True)
+        # Kern-Objekte
+        self.camera   = CameraThread(use_csi=True)
         self.detector = FaceDetector()
-        self.effects = EffectsProcessor()
+        self.effects  = EffectsProcessor()
         self.recorder = Recorder()
 
-        # Referenzen auf Effekt-Buttons für programmatischen Check-Update
+        # Button-Referenzen für programmatische Updates
         self._effect_buttons: dict = {}
 
         self._build_ui()
 
+        # Verarbeitungsthread
         self.proc_thread = ProcessingThread(
             self.camera, self.detector, self.effects, self.recorder
         )
@@ -245,247 +375,254 @@ class MainWindow(QMainWindow):
         self.camera.start()
         self.proc_thread.start()
 
-        self._status_timer = QTimer()
+        # Status-Prüf-Timer (1 Sek.)
+        self._status_timer = QTimer(self)
         self._status_timer.timeout.connect(self._check_camera_status)
         self._status_timer.start(1000)
 
+        # REC-Blink-Timer
         self._rec_blink = False
-        self._rec_timer = QTimer()
+        self._rec_timer = QTimer(self)
         self._rec_timer.timeout.connect(self._blink_rec_indicator)
 
-    # ─── UI-Aufbau ───────────────────────────────────────────────────────────
+    # ── UI-Aufbau ────────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(0, 0, 0, 0)
-        main_layout.setSpacing(0)
+        root = QWidget()
+        self.setCentralWidget(root)
+        vbox = QVBoxLayout(root)
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(0)
 
-        main_layout.addWidget(self._build_header())
+        vbox.addWidget(self._build_header())
 
+        # Inhaltsbereich
         content = QWidget()
-        cl = QHBoxLayout(content)
-        cl.setContentsMargins(12, 12, 12, 8)
-        cl.setSpacing(12)
-        cl.addWidget(self._build_left_panel(), 0)
-        cl.addWidget(self._build_video_area(), 1)
-        cl.addWidget(self._build_right_panel(), 0)
-        main_layout.addWidget(content, 1)
+        hbox = QHBoxLayout(content)
+        hbox.setContentsMargins(14, 14, 14, 10)
+        hbox.setSpacing(12)
+        hbox.addWidget(self._build_left_panel(), 0)
+        hbox.addWidget(self._build_video_area(), 1)
+        hbox.addWidget(self._build_right_panel(), 0)
+        vbox.addWidget(content, 1)
 
-        main_layout.addWidget(self._build_status_bar())
+        vbox.addWidget(self._build_statusbar())
+
+    # ── Header ───────────────────────────────────────────────────────────────
 
     def _build_header(self) -> QWidget:
-        header = QWidget()
-        header.setFixedHeight(56)
-        header.setStyleSheet(f"background: {C_PANEL}; border-bottom: 1px solid {C_BORDER};")
-        layout = QHBoxLayout(header)
-        layout.setContentsMargins(20, 0, 20, 0)
+        w = QWidget()
+        w.setFixedHeight(52)
+        w.setStyleSheet(
+            f"background-color: {C_PANEL2}; border-bottom: 1px solid {C_BORDER};"
+        )
+        hbox = QHBoxLayout(w)
+        hbox.setContentsMargins(20, 0, 20, 0)
+        hbox.setSpacing(0)
 
         title = QLabel("FaceCensor Pro")
-        title.setStyleSheet(f"""
-            color: {C_BUTTON};
-            font-size: 18px; font-weight: bold;
-            font-family: "Palatino Linotype", Georgia, serif;
-            letter-spacing: 1px;
-        """)
-        subtitle = QLabel("Content Creator Edition  ·  Jetson Nano")
-        subtitle.setStyleSheet(f"color: {C_TEXT_DIM}; font-size: 11px; padding-left: 10px;")
+        title.setStyleSheet(
+            f"color: {C_BUTTON}; font-size: 16px; font-weight: 700; "
+            f"font-family: {FONT_STACK}; background: transparent;"
+        )
 
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
-        layout.addStretch()
+        sub = QLabel("  ·  Jetson Nano Edition")
+        sub.setStyleSheet(
+            f"color: {C_TEXT_DIM}; font-size: 12px; font-family: {FONT_STACK}; background: transparent;"
+        )
 
-        self.rec_indicator = QLabel("REC")
+        hbox.addWidget(title)
+        hbox.addWidget(sub)
+        hbox.addStretch()
+
+        self.rec_indicator = QLabel("● AUFNAHME")
         self.rec_indicator.setStyleSheet(
-            f"color: {C_DANGER}; font-size: 12px; font-weight: bold; padding-right: 4px;"
+            f"color: {C_DANGER}; font-size: 11px; font-weight: 700; "
+            f"font-family: {FONT_STACK}; background: transparent;"
         )
         self.rec_indicator.setVisible(False)
-        layout.addWidget(self.rec_indicator)
-        return header
+        hbox.addWidget(self.rec_indicator)
+        return w
+
+    # ── Video-Bereich ─────────────────────────────────────────────────────────
 
     def _build_video_area(self) -> QWidget:
-        container = QWidget()
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        w = QWidget()
+        vbox = QVBoxLayout(w)
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(8)
 
-        self.video_label = QLabel("Kamera wird gestartet...")
+        # Kamera-Vorschau
+        self.video_label = QLabel("Kamera wird gestartet …")
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setMinimumSize(480, 360)
-        self.video_label.setStyleSheet(f"""
-            background-color: #0D1720;
-            border-radius: 12px;
-            border: 1px solid {C_BORDER};
-            color: {C_TEXT_DIM};
-            font-size: 14px;
-        """)
         self.video_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        layout.addWidget(self.video_label, 1)
-        layout.addWidget(self._build_stats_row())
-        return container
+        self.video_label.setStyleSheet(
+            f"background-color: {C_VIDEO_BG}; border-radius: 10px; "
+            f"border: 1px solid {C_BORDER}; color: {C_TEXT_DIM}; font-size: 13px;"
+        )
+        vbox.addWidget(self.video_label, 1)
+        vbox.addWidget(self._build_stats_bar())
+        return w
 
-    def _build_stats_row(self) -> QWidget:
-        row = QWidget()
-        row.setFixedHeight(64)
-        row.setStyleSheet(f"background: {C_PANEL}; border-radius: 10px; border: 1px solid {C_BORDER};")
-        layout = QHBoxLayout(row)
-        layout.setContentsMargins(16, 8, 16, 8)
-        layout.setSpacing(0)
+    def _build_stats_bar(self) -> QWidget:
+        """Drei Kennzahlen: Bildrate / Gesichter / Effekt."""
+        bar = QWidget()
+        bar.setFixedHeight(62)
+        bar.setStyleSheet(
+            f"background-color: {C_PANEL2}; border-radius: 10px; border: 1px solid {C_BORDER};"
+        )
+        hbox = QHBoxLayout(bar)
+        hbox.setContentsMargins(20, 6, 20, 6)
+        hbox.setSpacing(0)
 
-        def stat_widget(label: str, default: str):
-            w = QWidget()
-            v = QVBoxLayout(w)
+        def stat(label_txt: str, default: str):
+            cell = QWidget()
+            cell.setStyleSheet("background: transparent;")
+            v = QVBoxLayout(cell)
             v.setContentsMargins(0, 0, 0, 0)
             v.setSpacing(1)
+
             val = QLabel(default)
-            val.setStyleSheet("color: #FFFFFF; font-size: 20px; font-weight: bold; background: transparent;")
             val.setAlignment(Qt.AlignCenter)
-            lbl = QLabel(label)
-            lbl.setStyleSheet(f"color: {C_TEXT_DIM}; font-size: 10px; letter-spacing: 1px; background: transparent;")
+            val.setStyleSheet(
+                f"color: #FFFFFF; font-size: 19px; font-weight: 700; "
+                f"font-family: {FONT_STACK}; background: transparent;"
+            )
+
+            lbl = QLabel(label_txt)
             lbl.setAlignment(Qt.AlignCenter)
+            lbl.setStyleSheet(
+                f"color: {C_TEXT_DIM}; font-size: 9px; letter-spacing: 1.2px; "
+                f"font-family: {FONT_STACK}; background: transparent;"
+            )
+
             v.addWidget(val)
             v.addWidget(lbl)
-            return w, val
+            return cell, val
 
-        def vline():
-            l = QFrame()
-            l.setFrameShape(QFrame.VLine)
-            l.setStyleSheet(f"background: {C_BORDER}; max-width: 1px;")
-            return l
+        fps_w,  self.fps_label        = stat("BILDRATE",  "—")
+        face_w, self.face_count_label = stat("GESICHTER", "0")
+        mode_w, self.mode_label       = stat("EFFEKT",    "—")
 
-        fps_w, self.fps_label = stat_widget("FPS", "—")
-        face_w, self.face_count_label = stat_widget("GESICHTER", "0")
-        mode_w, self.mode_label = stat_widget("MODUS", "—")
+        hbox.addWidget(fps_w)
+        hbox.addWidget(v_divider())
+        hbox.addWidget(face_w)
+        hbox.addWidget(v_divider())
+        hbox.addWidget(mode_w)
+        return bar
 
-        layout.addWidget(fps_w)
-        layout.addWidget(vline())
-        layout.addWidget(face_w)
-        layout.addWidget(vline())
-        layout.addWidget(mode_w)
-        return row
+    # ── Linkes Panel (Effekte + Stärke) ──────────────────────────────────────
 
     def _build_left_panel(self) -> QWidget:
         panel = QWidget()
-        panel.setFixedWidth(210)
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
+        panel.setFixedWidth(205)
+        vbox = QVBoxLayout(panel)
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(10)
 
         # ── Effekte ──
-        effects_frame = QFrame()
-        effects_frame.setStyleSheet(panel_style())
-        ef_layout = QVBoxLayout(effects_frame)
-        ef_layout.setContentsMargins(12, 12, 12, 12)
-        ef_layout.setSpacing(5)
-        ef_layout.addWidget(make_section_label("Effekte"))
+        ef_card = self._make_card()
+        ef_vbox = QVBoxLayout(ef_card)
+        ef_vbox.setContentsMargins(12, 12, 12, 12)
+        ef_vbox.setSpacing(5)
+        ef_vbox.addWidget(section_label("Effekt"))
 
-        self.effect_btn_group = QButtonGroup()
+        self.effect_btn_group = QButtonGroup(self)
         self.effect_btn_group.setExclusive(True)
 
-        first_btn = None
         for effect_id, info in EFFECTS.items():
             btn = QPushButton(info["name"])
             btn.setCheckable(True)
-            # Standard-Effekt initial aktivieren
-            is_default = (effect_id == DEFAULT_EFFECT)
-            btn.setChecked(is_default)
-            btn.setStyleSheet(effect_btn_style(checked=is_default))
+            btn.setProperty("active", "false")
+
+            if effect_id == DEFAULT_EFFECT:
+                btn.setProperty("active", "true")
+                btn.setStyleSheet(
+                    f"QPushButton {{ background-color: {C_ACCENT}; color: #FFF; "
+                    f"border: none; border-radius: 8px; padding: 9px 12px; "
+                    f"font-family: {FONT_STACK}; font-size: 12px; font-weight: 600; text-align: left; }}"
+                )
+            else:
+                btn.setStyleSheet(self._default_btn_ss())
+
             btn.clicked.connect(
-                lambda checked, eid=effect_id, b=btn: self._on_effect_clicked(eid, b)
+                lambda _checked, eid=effect_id: self._on_effect_clicked(eid)
             )
             self.effect_btn_group.addButton(btn)
             self._effect_buttons[effect_id] = btn
-            ef_layout.addWidget(btn)
-            if first_btn is None:
-                first_btn = btn
+            ef_vbox.addWidget(btn)
 
-        layout.addWidget(effects_frame)
+        vbox.addWidget(ef_card)
 
-        # ── Stärke-Slider ──
-        strength_frame = QFrame()
-        strength_frame.setStyleSheet(panel_style())
-        sl_layout = QVBoxLayout(strength_frame)
-        sl_layout.setContentsMargins(12, 12, 12, 12)
-        sl_layout.setSpacing(6)
-        sl_layout.addWidget(make_section_label("Staerke"))
+        # ── Stärke ──
+        st_card = self._make_card()
+        st_vbox = QVBoxLayout(st_card)
+        st_vbox.setContentsMargins(12, 12, 12, 14)
+        st_vbox.setSpacing(8)
+        st_vbox.addWidget(section_label("Stärke"))
 
         slider_row = QHBoxLayout()
+        slider_row.setSpacing(8)
+
         self.strength_slider = QSlider(Qt.Horizontal)
         self.strength_slider.setRange(10, 100)
         self.strength_slider.setValue(50)
         self.strength_slider.valueChanged.connect(self._on_strength_changed)
 
         self.strength_value_label = QLabel("50")
-        self.strength_value_label.setFixedWidth(28)
+        self.strength_value_label.setFixedWidth(26)
+        self.strength_value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.strength_value_label.setStyleSheet(
-            f"color: {C_TEXT}; font-size: 12px; font-weight: bold;"
+            f"color: {C_TEXT}; font-size: 12px; font-weight: 600; "
+            f"font-family: {FONT_STACK}; background: transparent;"
         )
 
         slider_row.addWidget(self.strength_slider)
         slider_row.addWidget(self.strength_value_label)
-        sl_layout.addLayout(slider_row)
-        layout.addWidget(strength_frame)
+        st_vbox.addLayout(slider_row)
+        vbox.addWidget(st_card)
 
-        layout.addStretch()
+        vbox.addStretch()
         return panel
+
+    # ── Rechtes Panel (Presets / Emoji / Aktionen / Erkennung) ───────────────
 
     def _build_right_panel(self) -> QWidget:
         panel = QWidget()
-        panel.setFixedWidth(210)
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
+        panel.setFixedWidth(205)
+        vbox = QVBoxLayout(panel)
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(10)
 
-        # ── Presets ──
-        preset_frame = QFrame()
-        preset_frame.setStyleSheet(panel_style())
-        pr_layout = QVBoxLayout(preset_frame)
-        pr_layout.setContentsMargins(12, 12, 12, 12)
-        pr_layout.setSpacing(5)
-        pr_layout.addWidget(make_section_label("Presets"))
+        # ── Schnellwahl ──
+        pr_card = self._make_card()
+        pr_vbox = QVBoxLayout(pr_card)
+        pr_vbox.setContentsMargins(12, 12, 12, 12)
+        pr_vbox.setSpacing(5)
+        pr_vbox.addWidget(section_label("Schnellwahl"))
 
-        self.preset_btn_group = QButtonGroup()
+        self.preset_btn_group = QButtonGroup(self)
         self.preset_btn_group.setExclusive(True)
 
         for pid, pinfo in PRESETS.items():
             btn = QPushButton(pinfo["name"])
             btn.setCheckable(True)
-            btn.setStyleSheet(f"""
-                QPushButton {{
-                    background-color: {C_BUTTON};
-                    color: #1F2A36;
-                    border: none;
-                    border-radius: 8px;
-                    padding: 8px 12px;
-                    font-family: "Palatino Linotype", Georgia, serif;
-                    font-size: 12px;
-                    font-weight: 500;
-                    text-align: left;
-                }}
-                QPushButton:hover {{ background-color: {C_BUTTON_HOV}; }}
-                QPushButton:pressed {{ background-color: {C_BUTTON_ACT}; }}
-                QPushButton:checked {{
-                    background-color: {C_SUCCESS};
-                    color: #FFFFFF;
-                    font-weight: 600;
-                }}
-            """)
-            btn.clicked.connect(lambda checked, p=pid: self._apply_preset(p))
+            btn.setStyleSheet(self._preset_btn_ss(active=False))
+            btn.clicked.connect(lambda _c, p=pid: self._apply_preset(p))
             self.preset_btn_group.addButton(btn)
-            pr_layout.addWidget(btn)
+            pr_vbox.addWidget(btn)
 
-        layout.addWidget(preset_frame)
+        vbox.addWidget(pr_card)
 
-        # ── Emoji-Auswahl ──
-        emoji_frame = QFrame()
-        emoji_frame.setStyleSheet(panel_style())
-        em_layout = QVBoxLayout(emoji_frame)
-        em_layout.setContentsMargins(12, 12, 12, 12)
-        em_layout.setSpacing(5)
-        em_layout.addWidget(make_section_label("Emoji Overlay"))
+        # ── Überlagerung ──
+        em_card = self._make_card()
+        em_vbox = QVBoxLayout(em_card)
+        em_vbox.setContentsMargins(12, 12, 12, 12)
+        em_vbox.setSpacing(6)
+        em_vbox.addWidget(section_label("Überlagerung"))
 
-        self.emoji_btn_group = QButtonGroup()
+        self.emoji_btn_group = QButtonGroup(self)
         self.emoji_btn_group.setExclusive(True)
 
         emoji_items = list(EMOJIS.items())
@@ -495,188 +632,180 @@ class MainWindow(QMainWindow):
         row2.setSpacing(4)
 
         for i, (eid, einfo) in enumerate(emoji_items):
-            # Keine Emojis im Button-Label: nur der Name (Cool, Laugh, …)
             btn = QPushButton(einfo["name"])
             btn.setCheckable(True)
-            btn.setFixedHeight(32)
-            btn.setToolTip(einfo["name"])
-            btn.setStyleSheet(f"""
-                QPushButton {{
-                    background-color: {C_BUTTON};
-                    color: #1F2A36;
-                    border: none;
-                    border-radius: 6px;
-                    padding: 4px 6px;
-                    font-size: 10px;
-                    font-weight: 500;
-                    text-align: center;
-                    font-family: "Palatino Linotype", Georgia, serif;
-                }}
-                QPushButton:hover {{ background-color: {C_BUTTON_HOV}; }}
-                QPushButton:checked {{
-                    background-color: {C_ACCENT};
-                    color: #FFFFFF;
-                }}
-            """)
-            btn.clicked.connect(lambda checked, e=eid: self.effects.set_emoji(e))
+            btn.setFixedHeight(30)
+            btn.setStyleSheet(self._emoji_btn_ss(active=False))
+            btn.clicked.connect(lambda _c, e=eid: self._on_emoji_clicked(e))
             self.emoji_btn_group.addButton(btn)
-            if i < 4:
-                row1.addWidget(btn)
-            else:
-                row2.addWidget(btn)
+            (row1 if i < 4 else row2).addWidget(btn)
 
-        em_layout.addLayout(row1)
-        em_layout.addLayout(row2)
-        layout.addWidget(emoji_frame)
+        em_vbox.addLayout(row1)
+        em_vbox.addLayout(row2)
+        vbox.addWidget(em_card)
 
         # ── Aktionen ──
-        action_frame = QFrame()
-        action_frame.setStyleSheet(panel_style())
-        ac_layout = QVBoxLayout(action_frame)
-        ac_layout.setContentsMargins(12, 12, 12, 12)
-        ac_layout.setSpacing(8)
-        ac_layout.addWidget(make_section_label("Aktionen"))
+        ac_card = self._make_card()
+        ac_vbox = QVBoxLayout(ac_card)
+        ac_vbox.setContentsMargins(12, 12, 12, 12)
+        ac_vbox.setSpacing(6)
+        ac_vbox.addWidget(section_label("Aktionen"))
 
         screenshot_btn = QPushButton("Screenshot")
-        screenshot_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {C_BUTTON};
-                color: #1F2A36;
-                border: none; border-radius: 8px;
-                padding: 9px 12px; font-weight: 600;
-                font-family: "Palatino Linotype", Georgia, serif;
-                font-size: 12px; text-align: left;
-            }}
-            QPushButton:hover {{ background-color: {C_BUTTON_HOV}; }}
-            QPushButton:pressed {{ background-color: {C_BUTTON_ACT}; }}
-        """)
+        screenshot_btn.setStyleSheet(self._default_btn_ss())
         screenshot_btn.clicked.connect(self._take_screenshot)
-        ac_layout.addWidget(screenshot_btn)
+        ac_vbox.addWidget(screenshot_btn)
 
         self.record_btn = QPushButton("Aufnahme starten")
-        self._set_record_btn_style(recording=False)
+        self.record_btn.setStyleSheet(self._success_btn_ss())
         self.record_btn.clicked.connect(self._toggle_recording)
-        ac_layout.addWidget(self.record_btn)
+        ac_vbox.addWidget(self.record_btn)
 
-        layout.addWidget(action_frame)
+        vbox.addWidget(ac_card)
 
-        # ── Erkennung ──
-        detect_frame = QFrame()
-        detect_frame.setStyleSheet(panel_style())
-        dt_layout = QVBoxLayout(detect_frame)
-        dt_layout.setContentsMargins(12, 12, 12, 12)
-        dt_layout.setSpacing(6)
-        dt_layout.addWidget(make_section_label("Erkennung"))
+        # ── Gesichtserkennung ──
+        det_card = self._make_card()
+        det_vbox = QVBoxLayout(det_card)
+        det_vbox.setContentsMargins(12, 12, 12, 12)
+        det_vbox.setSpacing(6)
+        det_vbox.addWidget(section_label("Erkennung"))
 
         self.detection_btn = QPushButton("Aktiv")
         self.detection_btn.setCheckable(True)
         self.detection_btn.setChecked(True)
-        self._set_detection_btn_style(active=True)
+        self.detection_btn.setStyleSheet(self._accent_btn_ss())
         self.detection_btn.toggled.connect(self._on_detection_toggled)
-        dt_layout.addWidget(self.detection_btn)
+        det_vbox.addWidget(self.detection_btn)
 
-        layout.addWidget(detect_frame)
-        layout.addStretch()
+        vbox.addWidget(det_card)
+        vbox.addStretch()
         return panel
 
-    def _build_status_bar(self) -> QWidget:
+    # ── Statuszeile ───────────────────────────────────────────────────────────
+
+    def _build_statusbar(self) -> QWidget:
         bar = QWidget()
-        bar.setFixedHeight(30)
-        bar.setStyleSheet(f"background: {C_PANEL}; border-top: 1px solid {C_BORDER};")
-        layout = QHBoxLayout(bar)
-        layout.setContentsMargins(16, 0, 16, 0)
+        bar.setFixedHeight(28)
+        bar.setStyleSheet(
+            f"background-color: {C_PANEL2}; border-top: 1px solid {C_BORDER};"
+        )
+        hbox = QHBoxLayout(bar)
+        hbox.setContentsMargins(16, 0, 16, 0)
 
-        self.status_label = QLabel("Bereit  ·  Kamera wird initialisiert...")
-        self.status_label.setStyleSheet(f"color: {C_TEXT_DIM}; font-size: 11px;")
+        self.status_label = QLabel("Bereit  ·  Kamera wird initialisiert …")
+        self.status_label.setStyleSheet(
+            f"color: {C_TEXT_DIM}; font-size: 11px; font-family: {FONT_STACK}; background: transparent;"
+        )
 
-        hint = QLabel("ESC = Beenden   S = Screenshot   R = Aufnahme   Leertaste = Erkennung")
-        hint.setStyleSheet(f"color: {C_TEXT_DIM}; font-size: 10px;")
+        hint = QLabel("ESC  ·  S = Screenshot  ·  R = Aufnahme  ·  Leertaste = Erkennung")
+        hint.setStyleSheet(
+            f"color: {C_TEXT_DIM}; font-size: 10px; font-family: {FONT_STACK}; background: transparent;"
+        )
 
-        layout.addWidget(self.status_label)
-        layout.addStretch()
-        layout.addWidget(hint)
+        hbox.addWidget(self.status_label)
+        hbox.addStretch()
+        hbox.addWidget(hint)
         return bar
 
-    # ─── Style-Helfer ────────────────────────────────────────────────────────
+    # ── Style-Helfer (inline SS für spezifische Zustände) ─────────────────────
 
-    def _set_record_btn_style(self, recording: bool):
-        if recording:
-            self.record_btn.setStyleSheet(f"""
-                QPushButton {{
-                    background-color: {C_DANGER};
-                    color: #FFFFFF; border: none; border-radius: 8px;
-                    padding: 9px 12px; font-weight: 700;
-                    font-family: "Palatino Linotype", Georgia, serif;
-                    font-size: 12px; text-align: left;
-                }}
-                QPushButton:hover {{ background-color: #CF5A5A; }}
-            """)
-        else:
-            self.record_btn.setStyleSheet(f"""
-                QPushButton {{
-                    background-color: {C_SUCCESS};
-                    color: #FFFFFF; border: none; border-radius: 8px;
-                    padding: 9px 12px; font-weight: 700;
-                    font-family: "Palatino Linotype", Georgia, serif;
-                    font-size: 12px; text-align: left;
-                }}
-                QPushButton:hover {{ background-color: #5ACFA0; }}
-            """)
+    def _make_card(self) -> QFrame:
+        card = QFrame()
+        card.setStyleSheet(
+            f"QFrame {{ background-color: {C_PANEL}; border-radius: 10px; border: 1px solid {C_BORDER}; }}"
+        )
+        return card
 
-    def _set_detection_btn_style(self, active: bool):
+    def _default_btn_ss(self) -> str:
+        return (
+            f"QPushButton {{ background-color: {C_BUTTON}; color: {C_TEXT_DARK}; border: none; "
+            f"border-radius: 8px; padding: 9px 12px; font-family: {FONT_STACK}; "
+            f"font-size: 12px; font-weight: 500; text-align: left; }} "
+            f"QPushButton:hover {{ background-color: {C_BUTTON_HOV}; }} "
+            f"QPushButton:pressed {{ background-color: {C_BUTTON_ACT}; }}"
+        )
+
+    def _active_effect_btn_ss(self) -> str:
+        return (
+            f"QPushButton {{ background-color: {C_ACCENT}; color: #FFFFFF; border: none; "
+            f"border-radius: 8px; padding: 9px 12px; font-family: {FONT_STACK}; "
+            f"font-size: 12px; font-weight: 600; text-align: left; }}"
+        )
+
+    def _accent_btn_ss(self) -> str:
+        return (
+            f"QPushButton {{ background-color: {C_ACCENT}; color: #FFFFFF; border: none; "
+            f"border-radius: 8px; padding: 9px 12px; font-family: {FONT_STACK}; "
+            f"font-size: 12px; font-weight: 600; text-align: left; }} "
+            f"QPushButton:hover {{ background-color: #5BAECE; }}"
+        )
+
+    def _success_btn_ss(self) -> str:
+        return (
+            f"QPushButton {{ background-color: {C_SUCCESS}; color: #FFFFFF; border: none; "
+            f"border-radius: 8px; padding: 9px 12px; font-family: {FONT_STACK}; "
+            f"font-size: 12px; font-weight: 600; text-align: left; }} "
+            f"QPushButton:hover {{ background-color: #5AAD80; }}"
+        )
+
+    def _danger_btn_ss(self) -> str:
+        return (
+            f"QPushButton {{ background-color: {C_DANGER}; color: #FFFFFF; border: none; "
+            f"border-radius: 8px; padding: 9px 12px; font-family: {FONT_STACK}; "
+            f"font-size: 12px; font-weight: 600; text-align: left; }} "
+            f"QPushButton:hover {{ background-color: #CC5555; }}"
+        )
+
+    def _preset_btn_ss(self, active: bool) -> str:
         if active:
-            self.detection_btn.setStyleSheet(f"""
-                QPushButton {{
-                    background-color: {C_ACCENT};
-                    color: #FFFFFF; border: none; border-radius: 8px;
-                    padding: 8px 12px; font-weight: 600;
-                    font-family: "Palatino Linotype", Georgia, serif;
-                    font-size: 12px; text-align: left;
-                }}
-                QPushButton:hover {{ background-color: #5AB0CF; }}
-            """)
-        else:
-            self.detection_btn.setStyleSheet(f"""
-                QPushButton {{
-                    background-color: {C_BUTTON};
-                    color: #1F2A36; border: none; border-radius: 8px;
-                    padding: 8px 12px; font-weight: 500;
-                    font-family: "Palatino Linotype", Georgia, serif;
-                    font-size: 12px; text-align: left;
-                }}
-                QPushButton:hover {{ background-color: {C_BUTTON_HOV}; }}
-            """)
+            return (
+                f"QPushButton {{ background-color: {C_SUCCESS}; color: #FFFFFF; border: none; "
+                f"border-radius: 8px; padding: 9px 12px; font-family: {FONT_STACK}; "
+                f"font-size: 12px; font-weight: 600; text-align: left; }}"
+            )
+        return self._default_btn_ss()
 
-    # ─── Event Handler ────────────────────────────────────────────────────────
+    def _emoji_btn_ss(self, active: bool) -> str:
+        if active:
+            return (
+                f"QPushButton {{ background-color: {C_ACCENT}; color: #FFFFFF; border: none; "
+                f"border-radius: 6px; padding: 4px 6px; font-family: {FONT_STACK}; "
+                f"font-size: 10px; font-weight: 600; text-align: center; }}"
+            )
+        return (
+            f"QPushButton {{ background-color: {C_BUTTON}; color: {C_TEXT_DARK}; border: none; "
+            f"border-radius: 6px; padding: 4px 6px; font-family: {FONT_STACK}; "
+            f"font-size: 10px; font-weight: 400; text-align: center; }} "
+            f"QPushButton:hover {{ background-color: {C_BUTTON_HOV}; }} "
+            f"QPushButton:pressed {{ background-color: {C_BUTTON_ACT}; }}"
+        )
 
-    def _on_effect_clicked(self, effect_id: str, clicked_btn: QPushButton):
-        """Setzt Effekt und aktualisiert alle Button-Stile."""
-        self.effects.set_effect(effect_id)
-        for eid, btn in self._effect_buttons.items():
-            btn.setStyleSheet(effect_btn_style(checked=(eid == effect_id)))
+    # ── Event-Handler ─────────────────────────────────────────────────────────
 
     def _on_frame_ready(self, frame: np.ndarray, face_count: int, fps: float):
-        """
-        Empfängt verarbeiteten Frame und zeigt ihn im Video-Label an.
-
-        PERF: FastTransformation statt SmoothTransformation — auf Jetson Nano
-        deutlich schneller bei minimalem Qualitätsunterschied im Live-Feed.
-        """
+        """Frame anzeigen + Stats aktualisieren."""
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         q_img = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
-
-        pixmap = QPixmap.fromImage(q_img)
-        scaled = pixmap.scaled(
+        pixmap = QPixmap.fromImage(q_img).scaled(
             self.video_label.size(),
             Qt.KeepAspectRatio,
-            Qt.FastTransformation,   # PERF: schneller als SmoothTransformation
+            Qt.FastTransformation,
         )
-        self.video_label.setPixmap(scaled)
+        self.video_label.setPixmap(pixmap)
 
-        self.fps_label.setText(f"{fps:.0f}")
+        # FPS nur anzeigen wenn sinnvoll (> 0)
+        self.fps_label.setText(f"{fps:.1f}" if fps > 0.5 else "—")
         self.face_count_label.setText(str(face_count))
         self.mode_label.setText(self.effects.get_effect_name())
+
+    def _on_effect_clicked(self, effect_id: str):
+        self.effects.set_effect(effect_id)
+        for eid, btn in self._effect_buttons.items():
+            btn.setStyleSheet(
+                self._active_effect_btn_ss() if eid == effect_id
+                else self._default_btn_ss()
+            )
 
     def _on_strength_changed(self, value: int):
         self.strength_value_label.setText(str(value))
@@ -684,20 +813,42 @@ class MainWindow(QMainWindow):
 
     def _apply_preset(self, preset_id: str):
         self.effects.apply_preset(preset_id)
-        # Stärke-Slider synchronisieren
         preset = PRESETS.get(preset_id, {})
         if "strength" in preset:
             self.strength_slider.setValue(preset["strength"])
-        # Effekt-Button-Stile aktualisieren
-        active_effect = self.effects.current_effect
+        # Effekt-Buttons synchronisieren
+        active_eff = self.effects.current_effect
         for eid, btn in self._effect_buttons.items():
-            btn.setStyleSheet(effect_btn_style(checked=(eid == active_effect)))
-        self.status_label.setText(f"Preset aktiviert: {preset.get('name', preset_id)}")
+            btn.setStyleSheet(
+                self._active_effect_btn_ss() if eid == active_eff
+                else self._default_btn_ss()
+            )
+        # Preset-Buttons: aktiven hervorheben
+        for btn in self.preset_btn_group.buttons():
+            is_active = (btn.text() == preset.get("name", ""))
+            btn.setStyleSheet(self._preset_btn_ss(active=is_active))
+        self.status_label.setText(f"Schnellwahl: {preset.get('name', preset_id)}")
+
+    def _on_emoji_clicked(self, emoji_id: str):
+        self.effects.set_emoji(emoji_id)
+        # Emoji-Buttons: aktiven hervorheben, alle anderen zurücksetzen
+        from effects import EMOJIS as _EMOJIS
+        for btn in self.emoji_btn_group.buttons():
+            name_match = btn.text() == _EMOJIS.get(emoji_id, {}).get("name", "")
+            btn.setStyleSheet(self._emoji_btn_ss(active=name_match))
+        # Effekt-Button für Emoji-Overlay aktivieren
+        for eid, btn in self._effect_buttons.items():
+            btn.setStyleSheet(
+                self._active_effect_btn_ss() if eid == "emoji"
+                else self._default_btn_ss()
+            )
 
     def _on_detection_toggled(self, enabled: bool):
         self.proc_thread.set_detection_enabled(enabled)
         self.detection_btn.setText("Aktiv" if enabled else "Deaktiviert")
-        self._set_detection_btn_style(active=enabled)
+        self.detection_btn.setStyleSheet(
+            self._accent_btn_ss() if enabled else self._default_btn_ss()
+        )
         self.status_label.setText(
             f"Gesichtserkennung {'aktiviert' if enabled else 'deaktiviert'}"
         )
@@ -708,9 +859,11 @@ class MainWindow(QMainWindow):
             faces = self.detector.detect(frame)
             processed = self.effects.apply(frame.copy(), faces)
             filename = self.recorder.save_screenshot(processed)
-            self.status_label.setText(f"Screenshot gespeichert: {os.path.basename(filename)}")
+            self.status_label.setText(
+                f"Screenshot gespeichert: {os.path.basename(filename)}"
+            )
         else:
-            self.status_label.setText("Kein Frame fuer Screenshot verfuegbar")
+            self.status_label.setText("Kein Bild verfügbar")
 
     def _toggle_recording(self):
         if not self.recorder.is_recording:
@@ -718,20 +871,20 @@ class MainWindow(QMainWindow):
             if frame is not None:
                 self.recorder.start_recording(frame.shape)
                 self.record_btn.setText("Aufnahme stoppen")
-                self._set_record_btn_style(recording=True)
+                self.record_btn.setStyleSheet(self._danger_btn_ss())
                 self.rec_indicator.setVisible(True)
                 self._rec_timer.start(600)
                 self.status_label.setText(
-                    f"Aufnahme laeuft: {os.path.basename(self.recorder.current_file)}"
+                    f"Aufnahme läuft: {os.path.basename(self.recorder.current_file)}"
                 )
         else:
-            saved_file = self.recorder.stop_recording()
+            saved = self.recorder.stop_recording()
             self.record_btn.setText("Aufnahme starten")
-            self._set_record_btn_style(recording=False)
+            self.record_btn.setStyleSheet(self._success_btn_ss())
             self._rec_timer.stop()
             self.rec_indicator.setVisible(False)
             self.status_label.setText(
-                f"Aufnahme gespeichert: {os.path.basename(saved_file)}"
+                f"Gespeichert: {os.path.basename(saved)}"
             )
 
     def _blink_rec_indicator(self):
@@ -739,34 +892,34 @@ class MainWindow(QMainWindow):
         self.rec_indicator.setVisible(self._rec_blink)
 
     def _check_camera_status(self):
-        if self.camera.get_error():
-            self.status_label.setText(f"Kamera-Fehler: {self.camera.get_error()}")
+        err = self.camera.get_error()
+        if err:
+            self.status_label.setText(f"Kamera-Fehler: {err}")
         elif self.camera.is_running():
-            if any(x in self.status_label.text() for x in ("Bereit", "initialisiert")):
-                self.status_label.setText(f"Kamera aktiv  ·  {self.camera.get_fps():.0f} FPS")
+            txt = self.status_label.text()
+            if any(x in txt for x in ("Bereit", "initialisiert")):
+                self.status_label.setText("Kamera aktiv")
 
-    # ─── Keyboard Shortcuts ───────────────────────────────────────────────────
+    # ── Tastaturkürzel ────────────────────────────────────────────────────────
 
     def keyPressEvent(self, event):
-        key = event.key()
-        if key == Qt.Key_Escape:
+        k = event.key()
+        if k == Qt.Key_Escape:
             self.close()
-        elif key == Qt.Key_S:
+        elif k == Qt.Key_S:
             self._take_screenshot()
-        elif key == Qt.Key_R:
+        elif k == Qt.Key_R:
             self._toggle_recording()
-        elif key == Qt.Key_Space:
+        elif k == Qt.Key_Space:
             self.detection_btn.setChecked(not self.detection_btn.isChecked())
         super().keyPressEvent(event)
 
-    # ─── Shutdown ─────────────────────────────────────────────────────────────
+    # ── Sauberer Shutdown ─────────────────────────────────────────────────────
 
     def closeEvent(self, event):
-        print("FaceCensor Pro wird beendet...")
         if self.recorder.is_recording:
             self.recorder.stop_recording()
         self.proc_thread.stop()
         self.camera.stop()
         self.camera.join(timeout=2.0)
-        print("Shutdown abgeschlossen")
         event.accept()
