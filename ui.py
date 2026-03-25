@@ -379,16 +379,13 @@ class MainWindow(QMainWindow):
         self.face_btn.toggled.connect(self._on_face_toggled)
         cv.addWidget(self.face_btn)
 
-        # Handzensur
-        self.hand_btn = QPushButton("Hände  inaktiv")
+        # Handzensur – immer verfügbar (MediaPipe oder Hautfarb-Fallback)
+        hand_mode = self.hand_detector.get_mode()
+        hand_hint = "MediaPipe" if hand_mode == "mediapipe" else "Hautfarb-Modus"
+        self.hand_btn = QPushButton(f"Hände  inaktiv  ({hand_hint})")
         self.hand_btn.setCheckable(True)
         self.hand_btn.setChecked(False)
-        if not self.hand_detector.is_available():
-            self.hand_btn.setEnabled(False)
-            self.hand_btn.setText("Hände  (nicht verfügbar)")
-            self.hand_btn.setStyleSheet(_ss_beige())
-        else:
-            self.hand_btn.setStyleSheet(_ss_beige())
+        self.hand_btn.setStyleSheet(_ss_beige())
         self.hand_btn.toggled.connect(self._on_hand_toggled)
         cv.addWidget(self.hand_btn)
 
@@ -627,12 +624,15 @@ class MainWindow(QMainWindow):
 
     def _on_hand_toggled(self, enabled: bool):
         self.proc.set_hand(enabled)
-        self.hand_btn.setText("Hände  aktiv" if enabled else "Hände  inaktiv")
+        hand_mode = self.hand_detector.get_mode()
+        hand_hint = "MediaPipe" if hand_mode == "mediapipe" else "Hautfarb-Modus"
+        label = "aktiv" if enabled else "inaktiv"
+        self.hand_btn.setText(f"Hände  {label}  ({hand_hint})")
         self.hand_btn.setStyleSheet(
             _ss(C_ACCENT, "#FFF", "#5BAECE") if enabled else _ss_beige()
         )
         self.status_lbl.setText(
-            "Handzensur " + ("aktiviert" if enabled else "deaktiviert")
+            f"Handzensur {'aktiviert' if enabled else 'deaktiviert'}  ·  {hand_hint}"
         )
 
     def _on_model_select(self, model: str):
