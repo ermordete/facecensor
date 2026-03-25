@@ -1,15 +1,22 @@
 #!/usr/bin/python3
 """
-detector.py - Gesichtserkennung Modul
-=======================================
-Verbesserte Gesichtserkennung mit OpenCV DNN Face Detector
-und temporalem Smoothing gegen Flackern.
+detector.py – Gesichtserkennung mit zwei wählbaren Modellen
+=============================================================
 
-Warum DNN statt Haar Cascade?
-- Deutlich weniger False Positives
-- Robuster bei verschiedenen Winkeln / Beleuchtung
-- Ähnliche Performance auf Jetson Nano
-- Moderner und genauer
+Modell 1: Haar Cascade (haarcascade_frontalface_default.xml)
+  - Extrem leicht, keine Download-Abhängigkeit, immer verfügbar
+  - Sehr schnell auf Jetson Nano (~1–2 ms pro Frame bei 300px)
+  - Schwächer bei Seitenansicht / schlechter Beleuchtung
+  - Gut als "Schnell"-Modus geeignet
+
+Modell 2: OpenCV DNN ResNet-SSD (res10_300x300_ssd_iter_140000)
+  - Ca. ~10 MB Caffe-Modell, einmaliger Download
+  - Deutlich robuster: erkennt Gesichter in mehr Winkeln/Lagen
+  - Ca. 5–15 ms pro Frame bei 300px auf Jetson Nano
+  - Gut als "Präzise"-Modus geeignet
+
+Beide Modelle teilen dieselbe Tracking-Logik (IoU + gleitendes Smoothing),
+sodass der Wechsel zur Laufzeit nahtlos funktioniert.
 """
 
 import cv2
@@ -20,38 +27,61 @@ from typing import List, Tuple
 from dataclasses import dataclass, field
 
 
+# Modell-Konstanten für externe Referenz (z. B. UI)
+MODEL_HAAR = "haar"
+MODEL_DNN  = "dnn"
+MODEL_NAMES = {
+    MODEL_HAAR: "Schnell (Haar Cascade)",
+    MODEL_DNN:  "Präziser (OpenCV DNN)",
+}
+
+
 @dataclass
 class TrackedFace:
-    """Repräsentiert ein tracktes Gesicht mit Glättungs-Historie."""
+    """Tracktes Gesicht mit glättendem Positions-Puffer."""
     x: float
     y: float
     w: float
     h: float
     confidence: float
     missed_frames: int = 0
-    # Letzten N Positionen für Glättung
     history: List[Tuple[float, float, float, float]] = field(default_factory=list)
-    
+
     def to_int_rect(self) -> Tuple[int, int, int, int]:
         return (int(self.x), int(self.y), int(self.w), int(self.h))
 
 
 class FaceDetector:
     """
-    Gesichtsdetektor mit OpenCV DNN und temporalem Smoothing.
-    
-    Temporal Smoothing:
-    - Positionen werden über N Frames gemittelt → kein Springen
-    - Gesichter die kurz "verschwinden" werden noch kurz gehalten
-    - IoU-basiertes Tracking ordnet Detektionen vorhandenen Tracks zu
+    Gesichtsdetektor mit wählbarem Modell und temporalem Smoothing.
+
+    Nutzung:
+        detector = FaceDetector()
+        detector.set_model(MODEL_HAAR)   # oder MODEL_DNN
+        faces = detector.detect(frame)
     """
-    
-    # DNN Modell URLs (Caffe ResNet-SSD)
-    MODEL_URL = "https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel"
-    CONFIG_URL = "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt"
-    
+
+    # DNN-Modell Quellen (Caffe ResNet-SSD, ~10 MB)
+    _DNN_MODEL_URL  = (
+        "https://raw.githubusercontent.com/opencv/opencv_3rdparty/"
+        "dnn_samples_face_detector_20170830/"
+        "res10_300x300_ssd_iter_140000.caffemodel"
+    )
+    _DNN_CONFIG_URL = (
+        "https://raw.githubusercontent.com/opencv/opencv/master/"
+        "samples/dnn/face_detector/deploy.prototxt"
+    )
+
+    # Haar Cascade Suchpfade (systemweit auf Ubuntu/Jetson)
+    _HAAR_PATHS = [
+        "/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",
+        "/usr/share/opencv/haarcascades/haarcascade_frontalface_default.xml",
+        "/usr/local/share/opencv4/haarcascades/haarcascade_frontalface_default.xml",
+    ]
+
     def __init__(
         self,
+        model: str = MODEL_DNN,
         confidence_threshold: float = 0.5,
         smooth_frames: int = 5,
         max_missed_frames: int = 8,
@@ -59,280 +89,260 @@ class FaceDetector:
         model_dir: str = "models",
     ):
         self.confidence_threshold = confidence_threshold
-        self.smooth_frames = smooth_frames
-        self.max_missed_frames = max_missed_frames
-        self.face_padding = face_padding  # Prozentuale Vergrößerung der Bounding Box
-        
-        self._tracked_faces: List[TrackedFace] = []
-        self._net = None
-        self._use_dnn = False
-        self._haar_cascade = None
-        
-        # Modell laden
-        self._load_detector(model_dir)
-    
-    def _load_detector(self, model_dir: str):
-        """Lädt DNN-Modell, fällt auf Haar Cascade zurück."""
+        self.smooth_frames        = smooth_frames
+        self.max_missed_frames    = max_missed_frames
+        self.face_padding         = face_padding
+        self.model_dir            = model_dir
+
+        # Aktives Modell
+        self._current_model: str = model
+
+        # DNN-Objekt (lazy geladen)
+        self._dnn_net  = None
+        self._dnn_ok   = False
+
+        # Haar Cascade Objekt (lazy geladen)
+        self._haar     = None
+        self._haar_ok  = False
+
+        # Tracking-State
+        self._tracks: List[TrackedFace] = []
+
+        # Beide Modelle beim Start laden
+        self._load_dnn(model_dir)
+        self._load_haar()
+
+        # Sicherstellen dass gewünschtes Modell verfügbar
+        self._current_model = self._resolve_model(model)
+        print(f"Gesichtsmodell aktiv: {MODEL_NAMES.get(self._current_model)}")
+
+    # ── Modell laden ─────────────────────────────────────────────────────────
+
+    def _load_dnn(self, model_dir: str):
+        """
+        Lädt OpenCV DNN ResNet-SSD.
+        Datei-Download nur wenn noch nicht vorhanden.
+        """
         os.makedirs(model_dir, exist_ok=True)
-        
-        model_path = os.path.join(model_dir, "face_detector.caffemodel")
+        model_path  = os.path.join(model_dir, "face_detector.caffemodel")
         config_path = os.path.join(model_dir, "deploy.prototxt")
-        
-        # Versuche DNN-Modell zu laden
+
         if os.path.exists(model_path) and os.path.exists(config_path):
             try:
-                self._net = cv2.dnn.readNetFromCaffe(config_path, model_path)
-                self._use_dnn = True
-                print("✅ DNN Face Detector geladen")
+                self._dnn_net = cv2.dnn.readNetFromCaffe(config_path, model_path)
+                self._dnn_ok  = True
+                print("DNN Face Detector geladen")
                 return
             except Exception as e:
-                print(f"⚠️  DNN-Modell Fehler: {e}")
-        
-        # DNN-Modell herunterladen
-        print("📥 Lade DNN Face Detector Modell herunter...")
+                print(f"DNN Ladefehler: {e}")
+
+        print("Lade DNN Face Detector herunter (~10 MB) ...")
         try:
-            urllib.request.urlretrieve(self.MODEL_URL, model_path)
-            urllib.request.urlretrieve(self.CONFIG_URL, config_path)
-            self._net = cv2.dnn.readNetFromCaffe(config_path, model_path)
-            self._use_dnn = True
-            print("✅ DNN Face Detector geladen (heruntergeladen)")
-            return
+            urllib.request.urlretrieve(self._DNN_MODEL_URL,  model_path)
+            urllib.request.urlretrieve(self._DNN_CONFIG_URL, config_path)
+            self._dnn_net = cv2.dnn.readNetFromCaffe(config_path, model_path)
+            self._dnn_ok  = True
+            print("DNN Face Detector geladen (heruntergeladen)")
         except Exception as e:
-            print(f"⚠️  Download fehlgeschlagen: {e}")
-        
-        # Fallback: Haar Cascade
-        print("↩️  Fallback: Haar Cascade")
-        self._load_haar_cascade()
-    
-    def _load_haar_cascade(self):
-        """Lädt Haar Cascade als Fallback."""
-        paths = [
-            '/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml',
-            '/usr/share/opencv/haarcascades/haarcascade_frontalface_default.xml',
-            '/usr/local/share/opencv4/haarcascades/haarcascade_frontalface_default.xml',
-        ]
-        for p in paths:
+            print(f"DNN Download fehlgeschlagen: {e}")
+
+    def _load_haar(self):
+        """Lädt Haar Cascade aus Systempfaden."""
+        for p in self._HAAR_PATHS:
             if os.path.exists(p):
-                self._haar_cascade = cv2.CascadeClassifier(p)
-                if not self._haar_cascade.empty():
-                    print(f"✅ Haar Cascade geladen: {p}")
+                clf = cv2.CascadeClassifier(p)
+                if not clf.empty():
+                    self._haar    = clf
+                    self._haar_ok = True
+                    print(f"Haar Cascade geladen: {p}")
                     return
-        print("❌ Kein Detektor verfügbar!")
-    
+        print("Haar Cascade nicht gefunden (kein kritischer Fehler)")
+
+    def _resolve_model(self, requested: str) -> str:
+        """Wählt verfügbares Modell; fällt auf Alternative zurück."""
+        if requested == MODEL_DNN and self._dnn_ok:
+            return MODEL_DNN
+        if requested == MODEL_HAAR and self._haar_ok:
+            return MODEL_HAAR
+        # Fallback: was auch immer verfügbar ist
+        if self._dnn_ok:
+            return MODEL_DNN
+        if self._haar_ok:
+            return MODEL_HAAR
+        return MODEL_HAAR   # gibt leere Liste zurück wenn beides fehlt
+
+    # ── Öffentliche API ───────────────────────────────────────────────────────
+
+    def set_model(self, model: str):
+        """Wechselt das aktive Erkennungsmodell zur Laufzeit."""
+        resolved = self._resolve_model(model)
+        if resolved != self._current_model:
+            self._current_model = resolved
+            self._tracks.clear()   # Tracks verwerfen bei Modellwechsel
+            print(f"Gesichtsmodell gewechselt: {MODEL_NAMES.get(resolved)}")
+
+    def get_current_model(self) -> str:
+        return self._current_model
+
+    def is_model_available(self, model: str) -> bool:
+        if model == MODEL_DNN:
+            return self._dnn_ok
+        if model == MODEL_HAAR:
+            return self._haar_ok
+        return False
+
     def detect(self, frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
         """
-        Erkennt Gesichter und gibt geglättete Bounding Boxes zurück.
-        
-        Intern:
-        1. Neue Detektionen ermitteln
-        2. Mit bestehenden Tracks assoziieren (IoU)
-        3. Positionen glätten
-        4. Padding anwenden
-        
-        Returns: Liste von (x, y, w, h) Tuples
+        Erkennt Gesichter, gibt geglättete Bounding Boxes (x,y,w,h) zurück.
+
+        PERF: Intern auf 300px Breite skalieren → deutlich schneller.
+        Bounding Boxes werden danach zurückskaliert.
         """
-        # Für Detection intern kleiner skalieren → schneller
-        detect_frame, scale = self._prepare_detect_frame(frame)
-        
-        # Rohe Detektionen
-        raw_detections = self._raw_detect(detect_frame)
-        
-        # Zurück auf Originalmaßstab skalieren
-        scaled_detections = [
+        small, scale = self._shrink(frame, target_w=300)
+        raw = self._detect_raw(small)
+
+        # Zurück auf Original-Größe skalieren
+        scaled = [
             (int(x / scale), int(y / scale), int(w / scale), int(h / scale))
-            for (x, y, w, h) in raw_detections
+            for (x, y, w, h) in raw
         ]
-        
-        # Tracks aktualisieren
-        self._update_tracks(scaled_detections, frame.shape)
-        
-        # Geglättete Positionen mit Padding zurückgeben
+
+        self._update_tracks(scaled, frame.shape)
+
         result = []
-        for face in self._tracked_faces:
-            if face.missed_frames == 0:  # Nur aktive Faces
-                x, y, w, h = self._apply_padding(face, frame.shape)
-                result.append((x, y, w, h))
-        
+        for t in self._tracks:
+            if t.missed_frames == 0:
+                result.append(self._padded(t, frame.shape))
         return result
-    
-    def _prepare_detect_frame(
-        self, frame: np.ndarray, target_width: int = 300
-    ) -> Tuple[np.ndarray, float]:
-        """
-        Skaliert Frame für schnelle Detektion herunter.
-        Gibt (skalierter_frame, scale_faktor) zurück.
-        """
-        h, w = frame.shape[:2]
-        scale = target_width / w
-        new_h = int(h * scale)
-        small = cv2.resize(frame, (target_width, new_h))
-        return small, scale
-    
-    def _raw_detect(self, frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
-        """Führt eigentliche Detektion durch (DNN oder Haar Cascade)."""
-        if self._use_dnn and self._net is not None:
-            return self._dnn_detect(frame)
-        elif self._haar_cascade is not None:
-            return self._haar_detect(frame)
+
+    def reset_tracks(self):
+        self._tracks.clear()
+
+    def set_confidence_threshold(self, value: float):
+        self.confidence_threshold = max(0.1, min(1.0, value))
+
+    # ── Interne Detektion ─────────────────────────────────────────────────────
+
+    def _detect_raw(self, frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
+        if self._current_model == MODEL_DNN and self._dnn_ok:
+            return self._run_dnn(frame)
+        if self._haar_ok:
+            return self._run_haar(frame)
         return []
-    
-    def _dnn_detect(self, frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
-        """OpenCV DNN Gesichtserkennung (ResNet-SSD)."""
+
+    def _run_dnn(self, frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
+        """OpenCV DNN ResNet-SSD Detektion."""
         h, w = frame.shape[:2]
-        
-        # Blob erstellen (normalisiert für das Modell)
         blob = cv2.dnn.blobFromImage(
-            frame, 1.0, (300, 300),
-            (104.0, 177.0, 123.0),
-            swapRB=False
+            frame, 1.0, (300, 300), (104.0, 177.0, 123.0), swapRB=False
         )
-        self._net.setInput(blob)
-        detections = self._net.forward()
-        
-        faces = []
-        for i in range(detections.shape[2]):
-            confidence = detections[0, 0, i, 2]
-            if confidence < self.confidence_threshold:
+        self._dnn_net.setInput(blob)
+        dets = self._dnn_net.forward()
+
+        result = []
+        for i in range(dets.shape[2]):
+            conf = dets[0, 0, i, 2]
+            if conf < self.confidence_threshold:
                 continue
-            
-            box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
+            box = dets[0, 0, i, 3:7] * np.array([w, h, w, h])
             x1, y1, x2, y2 = box.astype(int)
-            
-            # Clamp auf Frame-Grenzen
-            x1 = max(0, x1)
-            y1 = max(0, y1)
-            x2 = min(w, x2)
-            y2 = min(h, y2)
-            
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
             fw, fh = x2 - x1, y2 - y1
             if fw > 10 and fh > 10:
-                faces.append((x1, y1, fw, fh))
-        
-        return faces
-    
-    def _haar_detect(self, frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
-        """Haar Cascade Fallback."""
+                result.append((x1, y1, fw, fh))
+        return result
+
+    def _run_haar(self, frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
+        """Haar Cascade Detektion."""
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        detected = self._haar_cascade.detectMultiScale(
-            gray,
-            scaleFactor=1.1,
-            minNeighbors=5,
-            minSize=(30, 30),
-            flags=cv2.CASCADE_SCALE_IMAGE,
+        dets = self._haar.detectMultiScale(
+            gray, scaleFactor=1.1, minNeighbors=5,
+            minSize=(30, 30), flags=cv2.CASCADE_SCALE_IMAGE,
         )
-        if len(detected) == 0:
+        if len(dets) == 0:
             return []
-        return [(int(x), int(y), int(w), int(h)) for (x, y, w, h) in detected]
-    
+        return [(int(x), int(y), int(w), int(h)) for (x, y, w, h) in dets]
+
+    # ── Tracking + Smoothing ──────────────────────────────────────────────────
+
     def _update_tracks(
         self,
         detections: List[Tuple[int, int, int, int]],
         frame_shape: Tuple[int, ...],
     ):
-        """
-        Assoziiert neue Detektionen mit bestehenden Tracks via IoU.
-        Nicht gematchte Tracks werden als 'missed' markiert.
-        """
-        matched_track_ids = set()
-        matched_det_ids = set()
-        
-        # Für jede Detektion: besten passenden Track suchen
+        matched_tracks = set()
+        matched_dets   = set()
+
         for det_id, det in enumerate(detections):
-            best_iou = 0.3  # Minimum IoU-Schwelle
-            best_track_id = -1
-            
-            for track_id, face in enumerate(self._tracked_faces):
-                if track_id in matched_track_ids:
+            best_iou, best_tid = 0.3, -1
+            for tid, t in enumerate(self._tracks):
+                if tid in matched_tracks:
                     continue
-                iou = self._compute_iou(det, face.to_int_rect())
+                iou = _iou(det, t.to_int_rect())
                 if iou > best_iou:
-                    best_iou = iou
-                    best_track_id = track_id
-            
-            if best_track_id >= 0:
-                # Track aktualisieren
-                face = self._tracked_faces[best_track_id]
-                face.missed_frames = 0
-                face.confidence = best_iou
-                
-                # Zur History hinzufügen
-                face.history.append(det)
-                if len(face.history) > self.smooth_frames:
-                    face.history.pop(0)
-                
-                # Geglättete Position berechnen
-                avg = np.mean(face.history, axis=0)
-                face.x, face.y, face.w, face.h = avg
-                
-                matched_track_ids.add(best_track_id)
-                matched_det_ids.add(det_id)
-        
-        # Nicht gematchte Tracks: missed_frames erhöhen
-        for track_id, face in enumerate(self._tracked_faces):
-            if track_id not in matched_track_ids:
-                face.missed_frames += 1
-        
-        # Neue Tracks für ungematchte Detektionen erstellen
+                    best_iou, best_tid = iou, tid
+
+            if best_tid >= 0:
+                t = self._tracks[best_tid]
+                t.missed_frames = 0
+                t.history.append(det)
+                if len(t.history) > self.smooth_frames:
+                    t.history.pop(0)
+                avg = np.mean(t.history, axis=0)
+                t.x, t.y, t.w, t.h = avg
+                matched_tracks.add(best_tid)
+                matched_dets.add(det_id)
+
+        for tid, t in enumerate(self._tracks):
+            if tid not in matched_tracks:
+                t.missed_frames += 1
+
         for det_id, det in enumerate(detections):
-            if det_id not in matched_det_ids:
+            if det_id not in matched_dets:
                 x, y, w, h = det
-                new_face = TrackedFace(
-                    x=float(x), y=float(y),
-                    w=float(w), h=float(h),
-                    confidence=1.0,
-                    history=[det],
-                )
-                self._tracked_faces.append(new_face)
-        
-        # Abgelaufene Tracks entfernen
-        self._tracked_faces = [
-            f for f in self._tracked_faces
-            if f.missed_frames <= self.max_missed_frames
+                self._tracks.append(TrackedFace(
+                    x=float(x), y=float(y), w=float(w), h=float(h),
+                    confidence=1.0, history=[det],
+                ))
+
+        self._tracks = [
+            t for t in self._tracks
+            if t.missed_frames <= self.max_missed_frames
         ]
-    
-    def _apply_padding(
-        self,
-        face: TrackedFace,
-        frame_shape: Tuple[int, ...],
+
+    def _padded(
+        self, t: TrackedFace, frame_shape: Tuple[int, ...]
     ) -> Tuple[int, int, int, int]:
-        """Vergrößert Bounding Box um padding_factor für bessere Abdeckung."""
-        pad_x = int(face.w * self.face_padding)
-        pad_y = int(face.h * self.face_padding)
-        
-        x = max(0, int(face.x) - pad_x)
-        y = max(0, int(face.y) - pad_y)
-        w = min(frame_shape[1] - x, int(face.w) + 2 * pad_x)
-        h = min(frame_shape[0] - y, int(face.h) + 2 * pad_y)
-        
+        pad_x = int(t.w * self.face_padding)
+        pad_y = int(t.h * self.face_padding)
+        x = max(0, int(t.x) - pad_x)
+        y = max(0, int(t.y) - pad_y)
+        w = min(frame_shape[1] - x, int(t.w) + 2 * pad_x)
+        h = min(frame_shape[0] - y, int(t.h) + 2 * pad_y)
         return (x, y, w, h)
-    
+
     @staticmethod
-    def _compute_iou(
-        a: Tuple[int, int, int, int],
-        b: Tuple[int, int, int, int],
-    ) -> float:
-        """Berechnet Intersection over Union zweier Bounding Boxes."""
-        ax, ay, aw, ah = a
-        bx, by, bw, bh = b
-        
-        ix1 = max(ax, bx)
-        iy1 = max(ay, by)
-        ix2 = min(ax + aw, bx + bw)
-        iy2 = min(ay + ah, by + bh)
-        
-        if ix2 < ix1 or iy2 < iy1:
-            return 0.0
-        
-        intersection = (ix2 - ix1) * (iy2 - iy1)
-        area_a = aw * ah
-        area_b = bw * bh
-        union = area_a + area_b - intersection
-        
-        return intersection / union if union > 0 else 0.0
-    
-    def set_confidence_threshold(self, value: float):
-        self.confidence_threshold = max(0.1, min(1.0, value))
-    
-    def reset_tracks(self):
-        """Alle Tracks zurücksetzen."""
-        self._tracked_faces.clear()
+    def _shrink(
+        frame: np.ndarray, target_w: int
+    ) -> Tuple[np.ndarray, float]:
+        h, w = frame.shape[:2]
+        scale = target_w / w
+        return cv2.resize(frame, (target_w, int(h * scale))), scale
+
+
+# ── Hilfsfunktion ─────────────────────────────────────────────────────────────
+
+def _iou(
+    a: Tuple[int, int, int, int],
+    b: Tuple[int, int, int, int],
+) -> float:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ix1 = max(ax, bx);  iy1 = max(ay, by)
+    ix2 = min(ax+aw, bx+bw); iy2 = min(ay+ah, by+bh)
+    if ix2 < ix1 or iy2 < iy1:
+        return 0.0
+    inter = (ix2-ix1) * (iy2-iy1)
+    union = aw*ah + bw*bh - inter
+    return inter / union if union > 0 else 0.0
