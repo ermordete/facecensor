@@ -385,7 +385,7 @@ class MainWindow(QMainWindow):
         self.hand_btn.setChecked(False)
         if not self.hand_detector.is_available():
             self.hand_btn.setEnabled(False)
-            self.hand_btn.setText("Hände  (kein Modell)")
+            self.hand_btn.setText("Hände  (nicht verfügbar)")
             self.hand_btn.setStyleSheet(_ss_beige())
         else:
             self.hand_btn.setStyleSheet(_ss_beige())
